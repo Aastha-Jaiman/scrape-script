@@ -1,76 +1,97 @@
-const axios = require("axios");
-const cheerio = require("cheerio");
-const Book = require("../models/Book");
-const exportToExcel = require("../utils/exportToExcel");
+const ExcelJS = require("exceljs");
+const ScrapedData = require("../models/ScrapedData");
 const sendEmail = require("../utils/sendEmail");
+const UrlScrape = require("../utils/urlScrape");
+const path = require("path");
+const fs = require("fs");
 
-const scrapeBooks = async (req, res) => {
+const scrapeDynamic = async (req, res) => {
   try {
-    const url = "https://books.toscrape.com/";
-    const { data } = await axios.get(url);
-    const $ = cheerio.load(data);
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "URL is required" });
 
-    let books = [];
+    const data = await UrlScrape(url);
 
-    $(".product_pod").each((i, el) => {
-      books.push({
-        title: $(el).find("h3 a").attr("title"),
-        price: $(el).find(".price_color").text(),
-        availability: $(el).find(".availability").text().trim(),
-        rating: $(el).find("p").attr("class").replace("star-rating ", ""),
-        url: "https://books.toscrape.com/" + $(el).find("h3 a").attr("href"),
-      });
+    // Save in DB
+    const record = await ScrapedData.create({ url, data });
+
+    // Excel export
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Scraped Data");
+    worksheet.columns = [
+      { header: "Tag", key: "tag", width: 15 },
+      { header: "Text", key: "text", width: 60 },
+      { header: "Href", key: "href", width: 40 },
+    ];
+    worksheet.addRows(data);
+
+    const exportDir = path.join(__dirname, "../exports");
+    if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir);
+
+    const filePath = path.join(exportDir, `scraped-${Date.now()}.xlsx`);
+    await workbook.xlsx.writeFile(filePath);
+
+    res.json({
+      success: true,
+      message: "Scraping successful (static or JS site)",
+      record,
+      file: filePath,
     });
-
-    await Book.deleteMany({});
-    await Book.insertMany(books);
-
-    res.json({ success: true, count: books.length, books });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: "Scraping failed" });
-  }
-};
-
-const exportBooks = async (req, res) => {
-  try {
-    const books = await Book.find();
-    if (books.length === 0) {
-      return res.status(404).json({ success: false, message: "No books found" });
-    }
-
-    const filePath = await exportToExcel(books);
-    res.download(filePath); // user ko file download karne dega
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Excel export failed" });
+    res.status(500).json({ error: "Scraping failed", message: err.message });
   }
 };
 
 
-const emailBooks = async (req, res) => {
+
+// GET -> fetch all scraped data
+const getScrapedData = async (req, res) => {
   try {
-    const { recipients } = req.body; 
-    const books = await Book.find();
+    const data = await ScrapedData.find().sort({ createdAt: -1 });
+    res.json({ success: true, count: data.length, data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Fetching failed" });
+  }
+};
 
-    if (books.length === 0) {
-      return res.status(404).json({ success: false, message: "No books found" });
-    }
+// POST -> email scraped data excel
+const emailScrapedData = async (req, res) => {
+  try {
+    const { recipients } = req.body;
+    if (!recipients) return res.status(400).json({ error: "Recipients required" });
 
-    const filePath = await exportToExcel(books);
+    // latest scrape data fetch
+    const latest = await ScrapedData.findOne().sort({ createdAt: -1 });
+    if (!latest) return res.status(404).json({ error: "No scraped data found" });
+
+    // Excel export
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Scraped Data");
+    worksheet.columns = [
+      { header: "Tag", key: "tag", width: 15 },
+      { header: "Text", key: "text", width: 60 },
+      { header: "Href", key: "href", width: 40 },
+    ];
+    worksheet.addRows(latest.data);
+
+    const filePath = `exports/scraped-${Date.now()}.xlsx`;
+    await workbook.xlsx.writeFile(filePath);
+
+    // send mail
     const emailSent = await sendEmail(recipients, filePath);
 
     if (emailSent) {
       res.json({ success: true, message: "Email sent successfully" });
     } else {
-      res.status(500).json({ success: false, error: "Email sending failed" });
+      res.status(500).json({ error: "Email sending failed" });
     }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: "Email failed" });
+    res.status(500).json({ error: "Email failed" });
   }
 };
 
-module.exports = { scrapeBooks, exportBooks, emailBooks };
-
+module.exports = { scrapeDynamic, getScrapedData, emailScrapedData };
 
